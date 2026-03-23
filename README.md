@@ -40,7 +40,17 @@ Response: {
 }
 ```
 
-The [Music Stack Manager](https://github.com/craiglush/music-stack) includes this analyzer service built-in using essentia-tensorflow with Discogs-EffNet models.
+A standalone analyzer service is included in the `analyzer-service/` directory. Run it with Docker:
+
+```bash
+cd analyzer-service
+docker build -t mood-analyzer .
+docker run -d --name mood-analyzer -p 8000:8000 -v /path/to/music:/music:ro mood-analyzer
+```
+
+Or add it to your docker-compose alongside Navidrome (see `analyzer-service/docker-compose.example.yml`).
+
+Then set the plugin's "Analyzer Service URL" to `http://mood-analyzer:8000` in Navidrome's plugin settings.
 
 ## Building from Source
 
