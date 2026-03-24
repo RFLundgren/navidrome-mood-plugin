@@ -100,8 +100,28 @@ The Docker image (~500MB) includes:
 - `essentia-tensorflow` with pre-trained Discogs-EffNet embedding model
 - 6 mood classification heads (happy, sad, relaxed, aggressive, party) + danceability
 - BPM and energy extraction
+- Genre/BPM-aware context boosts (see below)
 
 You can also use any custom service that implements this API.
+
+### Context-Aware Scoring
+
+Raw essentia scores are adjusted using track metadata for better accuracy. Without this, genres like Drum & Bass score near-zero on danceability despite being inherently danceable.
+
+**Genre boosts** — 25+ genre keywords nudge scores based on the track's genre tag:
+
+| Genre | Adjustments |
+|-------|-------------|
+| DnB / Jungle / Drum & Bass | danceability +0.35, party +0.15, aggressive +0.10 |
+| Dance / House | danceability +0.20, party +0.10 |
+| Techno | danceability +0.25, party +0.15, aggressive +0.10 |
+| Metal | aggressive +0.25, relaxed -0.15 |
+| Ambient / Downtempo | relaxed +0.20, aggressive -0.10 |
+| Disco / Funk | danceability +0.20, party +0.15, happy +0.10 |
+| Pop | happy +0.05, danceability +0.05 |
+| Blues / Emo | sad +0.10–0.15 |
+
+**BPM correction** — DnB is often detected at half-time (86 BPM instead of 172). Tracks with 80–95 BPM in DnB/Jungle genres are corrected to double-time, which triggers a +0.20 danceability boost for the 140–180 BPM range.
 
 ## Configuration
 
@@ -139,7 +159,7 @@ All settings are configurable from Navidrome's plugin settings UI:
 └─────────────────────────────┘
 ```
 
-1. **Analysis** — On schedule, the plugin iterates all tracks via Subsonic API, sends unanalyzed ones to the analyzer service, and stores mood scores in its KVStore.
+1. **Analysis** — On schedule, the plugin iterates all tracks via Subsonic API, sends unanalyzed ones to the analyzer service, and stores mood scores in its KVStore. The analyzer extracts raw audio features via essentia-tensorflow, then applies genre/BPM context boosts so that genre-specific characteristics (like DnB's danceability) are properly reflected.
 
 2. **Playlists** — On the refresh schedule, it queries stored mood data, selects tracks above each mood's threshold (sorted by score), and creates playlists via the Subsonic API.
 
