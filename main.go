@@ -194,6 +194,15 @@ func onInit() int32 {
 		pdk.Log(pdk.LogInfo, "Scheduled playlist refresh: "+refreshSchedule)
 	}
 
+	// Clear any stale tasks from previous runs, then ensure the queue exists
+	host.TaskClearQueue("mood-analysis")
+	if err := host.TaskCreateQueue("mood-analysis", host.QueueConfig{
+		Concurrency: 2,
+		MaxRetries:  3,
+	}); err != nil {
+		pdk.Log(pdk.LogDebug, "Task queue init: "+err.Error())
+	}
+
 	pdk.Log(pdk.LogInfo, "Mood Playlists plugin initialized")
 	return 0
 }
@@ -202,8 +211,17 @@ func onInit() int32 {
 
 //go:wasmexport nd_scheduler_callback
 func onSchedule() int32 {
-	payload := string(pdk.Input())
-	pdk.Log(pdk.LogInfo, "Scheduled task triggered: "+payload)
+	raw := string(pdk.Input())
+	pdk.Log(pdk.LogInfo, "Scheduled task triggered: "+raw)
+
+	// Navidrome passes a JSON object: {"scheduleId":"...","payload":"...","isRecurring":true}
+	var envelope struct {
+		Payload string `json:"payload"`
+	}
+	payload := raw
+	if err := json.Unmarshal([]byte(raw), &envelope); err == nil && envelope.Payload != "" {
+		payload = envelope.Payload
+	}
 
 	switch payload {
 	case "analyze":
@@ -297,17 +315,23 @@ func (p *moodPlugin) GetSimilarSongsByTrack(req metadata.SimilarSongsByTrackRequ
 
 // ── Analysis Logic ───────────────────────────────────────────────
 
-func runAnalysis() int32 {
-	analyzerURL := configString("analyzer_url", "http://music-manager:5000")
-	pdk.Log(pdk.LogInfo, "Running mood analysis via "+analyzerURL)
+type analysisTask struct {
+	ID     string `json:"id"`
+	Path   string `json:"path"`
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
+}
 
-	analyzed := 0
+func runAnalysis() int32 {
+	pdk.Log(pdk.LogInfo, "Queuing tracks for mood analysis...")
+
+	queued := 0
 	offset := 0
-	batchSize := 100
+	batchSize := 500
 
 	for {
 		uri := fmt.Sprintf("search3?query=&songCount=%d&songOffset=%d&albumCount=0&artistCount=0", batchSize, offset)
-		respStr, err := host.SubsonicAPICall(uri)
+		respStr, err := subsonicCall(uri)
 		if err != nil {
 			pdk.Log(pdk.LogError, "Subsonic API search failed: "+err.Error())
 			break
@@ -338,26 +362,17 @@ func runAnalysis() int32 {
 		}
 
 		for _, song := range songs {
-			key := "mood:" + song.ID
-			existing, ok, _ := host.KVStoreGet(key)
-			if ok && len(existing) > 0 {
+			taskData, _ := json.Marshal(analysisTask{
+				ID:     song.ID,
+				Path:   musicPath + "/" + song.Path,
+				Title:  song.Title,
+				Artist: song.Artist,
+			})
+			if _, err := host.TaskEnqueue("mood-analysis", taskData); err != nil {
+				pdk.Log(pdk.LogWarn, "Failed to queue "+song.Title+": "+err.Error())
 				continue
 			}
-
-			scores, err := callAnalyzer(analyzerURL, song.Path)
-			if err != nil {
-				pdk.Log(pdk.LogDebug, "Analysis failed for "+song.Title+": "+err.Error())
-				continue
-			}
-
-			data, _ := json.Marshal(scores)
-			if err := host.KVStoreSet(key, data); err != nil {
-				pdk.Log(pdk.LogWarn, "Failed to store mood data for "+song.Title)
-				continue
-			}
-
-			updateIndex(song.ID, song.Title, song.Artist)
-			analyzed++
+			queued++
 		}
 
 		offset += batchSize
@@ -366,8 +381,96 @@ func runAnalysis() int32 {
 		}
 	}
 
-	pdk.Log(pdk.LogInfo, fmt.Sprintf("Analysis complete: %d new tracks analyzed", analyzed))
+	pdk.Log(pdk.LogInfo, fmt.Sprintf("Queued %d tracks for analysis", queued))
 	return 0
+}
+
+// ── Task Executor ─────────────────────────────────────────────────
+
+//go:wasmexport nd_task_execute
+func onTaskExecute() int32 {
+	raw := pdk.Input()
+
+	// Navidrome wraps the payload in a JSON envelope: {"taskId":"...","payload":"base64...","attempt":1}
+	var envelope struct {
+		Payload []byte `json:"payload"`
+	}
+	taskData := raw
+	if err := json.Unmarshal(raw, &envelope); err == nil && len(envelope.Payload) > 0 {
+		taskData = envelope.Payload
+	}
+
+	var task analysisTask
+	if err := json.Unmarshal(taskData, &task); err != nil {
+		pdk.Log(pdk.LogError, "Failed to parse task payload: "+err.Error())
+		return 1
+	}
+
+	// Skip if already analyzed (may have been queued twice)
+	key := "mood:" + task.ID
+	existing, ok, _ := host.KVStoreGet(key)
+	if ok && len(existing) > 0 {
+		return 0
+	}
+
+	analyzerURL := configString("analyzer_url", "http://mood-analyzer:8000")
+	ndURL := strings.TrimRight(configString("navidrome_url", "http://navidrome:4533"), "/")
+	user := configString("navidrome_user", "")
+	pass := configString("navidrome_password", "")
+	streamURL := fmt.Sprintf("%s/rest/stream?id=%s&u=%s&p=%s&v=1.16.1&c=mood-plugin",
+		ndURL, url.QueryEscape(task.ID), url.QueryEscape(user), url.QueryEscape(pass))
+
+	scores, err := callAnalyzerURL(analyzerURL, streamURL)
+	if err != nil {
+		pdk.Log(pdk.LogWarn, fmt.Sprintf("Analysis failed for %s: %s", task.Title, err.Error()))
+		return 1
+	}
+
+	data, _ := json.Marshal(scores)
+	if err := host.KVStoreSet(key, data); err != nil {
+		pdk.Log(pdk.LogWarn, "Failed to store mood data for "+task.Title)
+		return 1
+	}
+
+	updateIndex(task.ID, task.Title, task.Artist)
+	pdk.Log(pdk.LogInfo, "Analyzed: "+task.Title)
+	return 0
+}
+
+func callAnalyzerURL(baseURL, streamURL string) (*MoodScores, error) {
+	reqBody, _ := json.Marshal(map[string]string{"url": streamURL})
+
+	resp, err := host.HTTPSend(host.HTTPRequest{
+		URL:       baseURL + "/api/analysis/url",
+		Method:    "POST",
+		Body:      reqBody,
+		Headers:   map[string]string{"Content-Type": "application/json"},
+		TimeoutMs: 300000, // 5 min — download + TF analysis
+	})
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("analyzer returned status %d", resp.StatusCode)
+	}
+
+	var analysis AnalysisResponse
+	if err := json.Unmarshal(resp.Body, &analysis); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &MoodScores{
+		MoodHappy:      analysis.MoodHappy,
+		MoodSad:        analysis.MoodSad,
+		MoodRelaxed:    analysis.MoodRelaxed,
+		MoodAggressive: analysis.MoodAggressive,
+		MoodParty:      analysis.MoodParty,
+		Danceability:   analysis.Danceability,
+		BPM:            analysis.BPM,
+		Energy:         analysis.Energy,
+		Arousal:        analysis.Arousal,
+		Valence:        analysis.Valence,
+	}, nil
 }
 
 func callAnalyzer(baseURL, filePath string) (*MoodScores, error) {
@@ -540,12 +643,45 @@ func createPlaylist(name string, songIDs []string) {
 	for _, id := range songIDs {
 		params += "&songId=" + url.QueryEscape(id)
 	}
-	_, err := host.SubsonicAPICall("createPlaylist?" + params)
+	_, err := subsonicCall("createPlaylist?" + params)
 	if err != nil {
 		pdk.Log(pdk.LogError, "Failed to create playlist '"+name+"': "+err.Error())
 		return
 	}
 	pdk.Log(pdk.LogInfo, fmt.Sprintf("Created playlist '%s' with %d tracks", name, len(songIDs)))
+}
+
+// ── Subsonic HTTP helper (for scheduler context where no user is injected) ───
+
+func subsonicCall(uri string) (string, error) {
+	ndURL := configString("navidrome_url", "http://navidrome:4533")
+	user := configString("navidrome_user", "")
+	pass := configString("navidrome_password", "")
+
+	if user == "" {
+		// No credentials configured — fall back to host call (works in user context)
+		return host.SubsonicAPICall(uri)
+	}
+
+	sep := "?"
+	if strings.Contains(uri, "?") {
+		sep = "&"
+	}
+	fullURL := fmt.Sprintf("%s/rest/%s%su=%s&p=%s&v=1.16.1&c=mood-plugin&f=json",
+		ndURL, uri, sep, url.QueryEscape(user), url.QueryEscape(pass))
+
+	resp, err := host.HTTPSend(host.HTTPRequest{
+		URL:       fullURL,
+		Method:    "GET",
+		TimeoutMs: 30000,
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return string(resp.Body), nil
 }
 
 // ── Helpers ──────────────────────────────────────────────────────

@@ -11,6 +11,8 @@ Run with: uvicorn app:app --host 0.0.0.0 --port 8000
 
 import logging
 import os
+import tempfile
+import urllib.request
 
 import mutagen
 import numpy as np
@@ -114,6 +116,9 @@ def _apply_context_boosts(scores, genre, artist, bpm):
 class AnalyzeRequest(BaseModel):
     file_path: str
 
+class AnalyzeUrlRequest(BaseModel):
+    url: str
+
 
 @app.get("/health")
 def health():
@@ -125,18 +130,14 @@ def health():
         return {"status": "error", "message": "essentia not installed"}
 
 
-@app.post("/api/analysis/file")
-def analyze_file(req: AnalyzeRequest):
-    if not os.path.exists(req.file_path):
-        raise HTTPException(status_code=404, detail=f"File not found: {req.file_path}")
-
+def _analyze_path(file_path: str) -> dict:
     es = _load_essentia()
     results = {}
 
     # Read metadata
     title, artist, album, genre = "", "", "", ""
     try:
-        tags = mutagen.File(req.file_path)
+        tags = mutagen.File(file_path)
         if tags:
             title = str((tags.get("\xa9nam") or tags.get("title") or [""])[0])
             artist = str((tags.get("\xa9ART") or tags.get("artist") or [""])[0])
@@ -145,15 +146,15 @@ def analyze_file(req: AnalyzeRequest):
     except Exception:
         pass
     if not title:
-        title = os.path.splitext(os.path.basename(req.file_path))[0]
+        title = os.path.splitext(os.path.basename(file_path))[0]
 
     # BPM
     try:
-        audio_44k = es.MonoLoader(filename=req.file_path, sampleRate=44100)()
+        audio_44k = es.MonoLoader(filename=file_path, sampleRate=44100)()
         bpm = es.RhythmExtractor2013(method="multifeature")(audio_44k)[0]
         results["bpm"] = round(float(bpm), 1)
     except Exception as e:
-        logger.warning(f"BPM failed for {req.file_path}: {e}")
+        logger.warning(f"BPM failed for {file_path}: {e}")
         results["bpm"] = 0.0
 
     # Energy (RMS)
@@ -163,7 +164,7 @@ def analyze_file(req: AnalyzeRequest):
         results["energy"] = 0.0
 
     # Embeddings
-    audio_16k = es.MonoLoader(filename=req.file_path, sampleRate=16000, resampleQuality=4)()
+    audio_16k = es.MonoLoader(filename=file_path, sampleRate=16000, resampleQuality=4)()
     effnet_path = os.path.join(MODELS_DIR, "discogs-effnet-bs64-1.pb")
 
     try:
@@ -177,7 +178,7 @@ def analyze_file(req: AnalyzeRequest):
             "mood_relaxed", "mood_aggressive", "mood_party"
         ]})
         results = _apply_context_boosts(results, genre, artist, results.get("bpm", 0))
-        return {"file_path": req.file_path, "title": title, "artist": artist,
+        return {"file_path": file_path, "title": title, "artist": artist,
                 "album": album, "genre": genre, **results}
 
     # Mood classifiers
@@ -220,5 +221,34 @@ def analyze_file(req: AnalyzeRequest):
     # Apply genre/BPM context boosts
     results = _apply_context_boosts(results, genre, artist, results.get("bpm", 0))
 
-    return {"file_path": req.file_path, "title": title, "artist": artist,
+    return {"file_path": file_path, "title": title, "artist": artist,
             "album": album, "genre": genre, **results}
+
+
+@app.post("/api/analysis/file")
+def analyze_file(req: AnalyzeRequest):
+    if not os.path.exists(req.file_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {req.file_path}")
+    return _analyze_path(req.file_path)
+
+
+@app.post("/api/analysis/url")
+def analyze_url(req: AnalyzeUrlRequest):
+    suffix = ".audio"
+    url_lower = req.url.lower().split("?")[0]
+    for ext in (".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aac"):
+        if url_lower.endswith(ext):
+            suffix = ext
+            break
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        urllib.request.urlretrieve(req.url, tmp_path)
+        return _analyze_path(tmp_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch or analyze URL: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)

@@ -10,11 +10,33 @@
     "schema": {
       "type": "object",
       "properties": {
+        "navidrome_url": {
+          "type": "string",
+          "title": "Navidrome URL",
+          "description": "Internal URL of your Navidrome server (e.g., http://navidrome:4533)",
+          "default": "http://navidrome:4533"
+        },
+        "navidrome_user": {
+          "type": "string",
+          "title": "Navidrome Admin Username",
+          "description": "Admin username for Navidrome API access (required for scheduled tasks)"
+        },
+        "navidrome_password": {
+          "type": "string",
+          "title": "Navidrome Admin Password",
+          "description": "Admin password for Navidrome API access (required for scheduled tasks)"
+        },
         "analyzer_url": {
           "type": "string",
           "title": "Analyzer Service URL",
-          "description": "URL of the mood analyzer HTTP service (e.g., http://music-manager:5000)",
-          "default": "http://music-manager:5000"
+          "description": "URL of the mood analyzer HTTP service (e.g., http://mood-analyzer:8000)",
+          "default": "http://mood-analyzer:8000"
+        },
+        "music_path": {
+          "type": "string",
+          "title": "Music Mount Path",
+          "description": "Absolute path where music is mounted in the analyzer container (e.g., /music)",
+          "default": "/music"
         },
         "auto_analyze": {
           "type": "boolean",
@@ -93,11 +115,43 @@
       "elements": [
         {
           "type": "Group",
+          "label": "Navidrome Connection",
+          "elements": [
+            {
+              "type": "HorizontalLayout",
+              "elements": [
+                {
+                  "type": "Control",
+                  "scope": "#/properties/navidrome_url"
+                },
+                {
+                  "type": "Control",
+                  "scope": "#/properties/navidrome_user"
+                },
+                {
+                  "type": "Control",
+                  "scope": "#/properties/navidrome_password"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "Group",
           "label": "Analyzer Service",
           "elements": [
             {
-              "type": "Control",
-              "scope": "#/properties/analyzer_url"
+              "type": "HorizontalLayout",
+              "elements": [
+                {
+                  "type": "Control",
+                  "scope": "#/properties/analyzer_url"
+                },
+                {
+                  "type": "Control",
+                  "scope": "#/properties/music_path"
+                }
+              ]
             },
             {
               "type": "HorizontalLayout",
@@ -193,6 +247,10 @@
     },
     "scheduler": {
       "reason": "Schedule periodic analysis and playlist refresh tasks"
+    },
+    "taskqueue": {
+      "reason": "Process audio analysis in background without blocking the scheduler",
+      "maxConcurrency": 2
     },
     "kvstore": {
       "reason": "Store mood analysis scores for each track",
