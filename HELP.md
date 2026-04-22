@@ -333,7 +333,7 @@ Each selects tracks scoring above a threshold on a single mood dimension. Thresh
 | Playlist | Scored by | Default threshold | Excludes |
 |----------|-----------|-------------------|---------|
 | **Happy Mix** | mood_happy | 0.55 | Tracks with mood_sad ≥ 0.4 |
-| **Chill Mix** | mood_relaxed | 0.55 | Tracks with mood_aggressive ≥ 0.35 |
+| **Chill Mix** | mood_relaxed | 0.40 | Tracks with mood_aggressive ≥ 0.35 |
 | **Energetic Mix** | danceability | 0.60 | — |
 | **Melancholy Mix** | mood_sad | 0.45 | Tracks with mood_happy ≥ 0.5 |
 | **Party Mix** | mood_party | 0.55 | Tracks with mood_sad ≥ 0.4 |
@@ -343,17 +343,19 @@ The exclusions prevent contradictory tracks appearing — for example a cheerful
 
 ### Composite mood playlists
 
-These require multiple conditions to all be true simultaneously. They use fixed thresholds tuned for their specific scenarios and are not configurable via the UI.
+These playlists exclude tracks that clearly don't fit the scenario, then take the highest-scoring tracks from what remains. This approach guarantees a full playlist regardless of how your library scores — every playlist always has tracks.
 
-| Playlist | Conditions | Sorted by |
-|----------|-----------|-----------|
-| **Study Mix** | relaxed ≥ 0.45, energy < 0.15, aggressive < 0.2, arousal < 0.4 | relaxed |
-| **Workout Mix** | danceability ≥ 0.55, energy ≥ 0.12, BPM ≥ 120, arousal ≥ 0.6 | energy |
-| **Sleep Mix** | relaxed ≥ 0.5, energy < 0.08, BPM < 100, arousal < 0.3 | relaxed |
-| **Road Trip Mix** | happy ≥ 0.4, danceability ≥ 0.45, energy ≥ 0.1 | happy |
-| **Cooking Mix** | happy ≥ 0.35, relaxed ≥ 0.3, danceability ≥ 0.3, aggressive < 0.2 | danceability |
-| **Dining Mix** | relaxed ≥ 0.4, happy ≥ 0.3, energy < 0.15, aggressive < 0.15 | relaxed |
-| **Background Mix** | relaxed ≥ 0.35, energy < 0.12, party < 0.3, aggressive < 0.2 | relaxed |
+| Playlist | Excludes | Sorted by |
+|----------|----------|-----------|
+| **Study Mix** | aggressive ≥ 0.45, party ≥ 0.50 | mood_relaxed |
+| **Workout Mix** | relaxed ≥ 0.60, sad ≥ 0.50 | danceability |
+| **Sleep Mix** | aggressive ≥ 0.30, party ≥ 0.35 | mood_relaxed |
+| **Road Trip Mix** | aggressive ≥ 0.40, sad ≥ 0.50 | mood_happy |
+| **Cooking Mix** | aggressive ≥ 0.45, sad ≥ 0.45 | mood_happy |
+| **Dining Mix** | aggressive ≥ 0.40 | mood_relaxed |
+| **Background Mix** | aggressive ≥ 0.50, party ≥ 0.55 | mood_relaxed |
+
+For example, Study Mix takes all tracks that are neither aggressive nor high-energy party music, then sorts them by relaxed score and picks the top 30 (or however many you've configured). The most genuinely relaxed tracks in your library always rise to the top.
 
 ### Tuning thresholds
 
@@ -364,6 +366,14 @@ These require multiple conditions to all be true simultaneously. They use fixed 
 - Lower the threshold — more tracks qualify
 - Check that enough tracks have been analyzed (see [Monitoring](#11-monitoring-analysis-progress))
 
+### Weekly variation
+
+By default, playlists change a little each time they are refreshed — even when no new tracks have been analyzed. The **Variation Pool** setting (default: 3) controls this. Instead of always picking the top 50 tracks, the plugin shuffles the top 150 qualifying tracks and picks 50 from those. Each refresh draws a different random 50 from the same high-quality pool.
+
+- Set **Variation Pool** to `1` to disable shuffling and always get the same deterministic top-N tracks
+- Set it higher (e.g. `5`) for more rotation between refreshes
+- Quality stays high regardless — all candidates come from the top-scoring tracks in your library
+
 ### Artist diversity
 
 **Max Tracks per Artist** (default: 3) prevents any one artist dominating a playlist. Tracks are sorted by score first, so the best-scoring tracks from each artist are kept and lower-scoring ones are dropped to make room for other artists. Set to `0` to disable the limit.
@@ -371,6 +381,10 @@ These require multiple conditions to all be true simultaneously. They use fixed 
 ### Duplicate tracks
 
 If the same recording appears on multiple albums in your library, only one copy appears in each playlist. The copy with the higher mood score is kept and the duplicate is dropped silently.
+
+### Playlist updates
+
+Each refresh updates existing playlists in-place rather than creating new ones. You will never accumulate duplicate playlists — the same 13 playlists are updated every time the refresh runs.
 
 ---
 
@@ -409,9 +423,10 @@ If the same recording appears on multiple albums in your library, only one copy 
 | `playlist_refresh_schedule` | `0 3 * * 0` | — | — | Cron expression for playlist refresh |
 | `playlist_track_count` | `30` | 10 | 200 | Maximum tracks per playlist |
 | `max_tracks_per_artist` | `3` | 0 | 50 | Maximum tracks per artist per playlist (0 = no limit) |
+| `playlist_variation_pool` | `3` | 1 | 10 | Shuffle top N × pool tracks before picking; higher = more weekly variety (1 = always same tracks) |
 | `similar_songs_count` | `20` | 5 | 100 | Tracks returned for Instant Mix |
 | `happy_threshold` | `0.55` | 0 | 1 | Minimum score for Happy Mix |
-| `chill_threshold` | `0.55` | 0 | 1 | Minimum score for Chill Mix |
+| `chill_threshold` | `0.40` | 0 | 1 | Minimum score for Chill Mix |
 | `energetic_threshold` | `0.60` | 0 | 1 | Minimum score for Energetic Mix |
 | `party_threshold` | `0.55` | 0 | 1 | Minimum score for Party Mix |
 | `melancholy_threshold` | `0.45` | 0 | 1 | Minimum score for Melancholy Mix |
@@ -537,6 +552,17 @@ docker start navidrome
 ```
 
 Replace `YOUR_NAVIDROME_VOLUME` with your actual volume name (find it with `docker inspect navidrome`).
+
+### Plugin stops working after copying a new .ndp
+
+Navidrome automatically **disables** the plugin whenever the `.ndp` file is replaced on disk. This is by design — it treats any file change as a new, unapproved plugin.
+
+After copying a new `.ndp`:
+1. Go to **Settings → Plugins**
+2. Find **Mood Playlists** and toggle it back on
+3. No restart required
+
+You will need to do this every time you update the plugin.
 
 ### Configuration changes not appearing in the UI
 
