@@ -61,10 +61,16 @@
         "reanalyze_percent": {
           "type": "integer",
           "title": "Random Re-analysis %",
-          "description": "Percentage of already-analyzed tracks to randomly re-analyze each nightly run (0 = disabled). Useful for keeping scores fresh.",
+          "description": "Percentage of already-analyzed tracks to randomly re-analyze each scheduled run (0 = disabled)",
           "default": 0,
           "minimum": 0,
           "maximum": 20
+        },
+        "reanalyze_schedule": {
+          "type": "string",
+          "title": "Re-analysis Schedule (cron)",
+          "description": "When to run the dedicated re-analysis pass (uncertain tracks + random %). Default: 1st of each month at 4 AM",
+          "default": "0 4 1 * *"
         },
         "playlist_refresh_schedule": {
           "type": "string",
@@ -209,6 +215,10 @@
                 {
                   "type": "Control",
                   "scope": "#/properties/reanalyze_percent"
+                },
+                {
+                  "type": "Control",
+                  "scope": "#/properties/reanalyze_schedule"
                 }
               ]
             }

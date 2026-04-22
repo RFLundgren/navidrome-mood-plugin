@@ -214,6 +214,16 @@ func onInit() int32 {
 		pdk.Log(pdk.LogInfo, "Scheduled playlist refresh: "+refreshSchedule)
 	}
 
+	if reanalyzePct := configInt("reanalyze_percent", 0); reanalyzePct > 0 || configBool("reanalyze_uncertain", true) {
+		reanalyzeSchedule := configString("reanalyze_schedule", "0 4 1 * *")
+		_, err := host.SchedulerScheduleRecurring(reanalyzeSchedule, "reanalyze", "mood-reanalyze")
+		if err != nil {
+			pdk.Log(pdk.LogError, "Failed to schedule re-analysis: "+err.Error())
+		} else {
+			pdk.Log(pdk.LogInfo, "Scheduled re-analysis task: "+reanalyzeSchedule)
+		}
+	}
+
 	// Clear any stale tasks from previous runs, then ensure the queue exists
 	host.TaskClearQueue("mood-analysis")
 	if err := host.TaskCreateQueue("mood-analysis", host.QueueConfig{
@@ -248,6 +258,8 @@ func onSchedule() int32 {
 		return runAnalysis()
 	case "refresh-playlists":
 		return refreshPlaylists()
+	case "reanalyze":
+		return runScheduledReanalysis()
 	default:
 		pdk.Log(pdk.LogWarn, "Unknown schedule payload: "+payload)
 		return 0
@@ -461,6 +473,19 @@ func runAnalysis() int32 {
 
 	host.KVStoreSet("analysis:offset", []byte(strconv.Itoa(offset)))
 	pdk.Log(pdk.LogInfo, fmt.Sprintf("Queued %d tracks (next offset: %d)", totalQueued, offset))
+	return 0
+}
+
+// runScheduledReanalysis is the handler for the dedicated re-analysis schedule.
+// Unlike the inline re-analysis in runAnalysis() (which only fires when there
+// are no new tracks), this runs on its own cron and always processes uncertain
+// tracks and the configured random percentage — ensuring scores improve even
+// in libraries that receive frequent additions.
+func runScheduledReanalysis() int32 {
+	pdk.Log(pdk.LogInfo, "Running scheduled re-analysis...")
+	const deadline = 20 * time.Second
+	start := time.Now()
+	queueReanalysis(start, deadline)
 	return 0
 }
 
