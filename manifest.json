@@ -84,8 +84,8 @@
         },
         "playlist_variation_pool": {
           "type": "integer",
-          "title": "Playlist Variation Pool",
-          "description": "Controls weekly variation: playlists are drawn randomly from the top N × this many qualifying tracks. Higher = more variety between refreshes (1 = always the same top tracks)",
+          "title": "Variation Pool",
+          "description": "Playlists draw randomly from the top N × pool qualifying tracks. Higher = more variety each refresh. 1 = always the same tracks.",
           "default": 3,
           "minimum": 1,
           "maximum": 10
@@ -210,7 +210,12 @@
                 {
                   "type": "Control",
                   "scope": "#/properties/playlist_variation_pool"
-                },
+                }
+              ]
+            },
+            {
+              "type": "HorizontalLayout",
+              "elements": [
                 {
                   "type": "Control",
                   "scope": "#/properties/similar_songs_count"
