@@ -337,9 +337,41 @@ func (p *moodPlugin) GetSimilarSongsByTrack(req metadata.SimilarSongsByTrackRequ
 
 type analysisTask struct {
 	ID     string `json:"id"`
-	Path   string `json:"path"`
 	Title  string `json:"title"`
 	Artist string `json:"artist"`
+	Force  bool   `json:"force,omitempty"` // bypass the skip-if-already-analyzed check
+}
+
+// isUncertain returns true when no mood score is clearly dominant — the model
+// could not confidently classify the track and a re-analysis may improve it.
+func isUncertain(scores *MoodScores) bool {
+	max := math.Max(scores.MoodHappy, math.Max(scores.MoodSad,
+		math.Max(scores.MoodRelaxed, math.Max(scores.MoodAggressive, scores.MoodParty))))
+	return max < 0.45 || scores.BPM == 0
+}
+
+// markUncertain records a track ID for future re-analysis.
+// Stored as a JSON map in KV under "mood:reanalyze". Capped at 1000 entries.
+// Concurrent writes from multiple workers are accepted — occasional lost IDs
+// are harmless; they will be caught in a future analysis run.
+func markUncertain(id string) {
+	data, ok, _ := host.KVStoreGet("mood:reanalyze")
+	var ids map[string]bool
+	if ok && len(data) > 0 {
+		json.Unmarshal(data, &ids)
+	}
+	if ids == nil {
+		ids = make(map[string]bool)
+	}
+	if len(ids) >= 1000 {
+		return
+	}
+	if ids[id] {
+		return
+	}
+	ids[id] = true
+	encoded, _ := json.Marshal(ids)
+	host.KVStoreSet("mood:reanalyze", encoded)
 }
 
 func runAnalysis() int32 {
@@ -387,13 +419,7 @@ func runAnalysis() int32 {
 		}
 
 		songs := result.SubsonicResponse.SearchResult3.Song
-		if len(songs) == 0 {
-			// End of library — reset for next full pass
-			offset = 0
-			host.KVStoreSet("analysis:offset", []byte("0"))
-			pdk.Log(pdk.LogInfo, fmt.Sprintf("Reached end of library, queued %d tracks total — offset reset to 0", totalQueued))
-			return 0
-		}
+		endOfLibrary := len(songs) == 0 || len(songs) < batchSize
 
 		for _, song := range songs {
 			// Skip tracks already analyzed — avoids unnecessary work when library is fully analyzed
@@ -412,12 +438,16 @@ func runAnalysis() int32 {
 			totalQueued++
 		}
 
-		offset += len(songs)
-		if len(songs) < batchSize {
-			// Partial page — end of library
+		if endOfLibrary {
+			// Reset offset for next full pass
 			offset = 0
 			host.KVStoreSet("analysis:offset", []byte("0"))
-			pdk.Log(pdk.LogInfo, fmt.Sprintf("Reached end of library, queued %d tracks total — offset reset to 0", totalQueued))
+			pdk.Log(pdk.LogInfo, fmt.Sprintf("Reached end of library, queued %d new tracks — offset reset to 0", totalQueued))
+
+			// Re-analysis phase — only runs when no new tracks were found (library fully analyzed)
+			if totalQueued == 0 {
+				queueReanalysis(start, deadline)
+			}
 			return 0
 		}
 
@@ -432,6 +462,75 @@ func runAnalysis() int32 {
 	host.KVStoreSet("analysis:offset", []byte(strconv.Itoa(offset)))
 	pdk.Log(pdk.LogInfo, fmt.Sprintf("Queued %d tracks (next offset: %d)", totalQueued, offset))
 	return 0
+}
+
+// queueReanalysis handles two types of re-analysis after a full library pass:
+//  1. Uncertain tracks — previously analyzed but with low-confidence scores
+//  2. Random percentage — a configurable fraction of all tracks, for gradual score refresh
+func queueReanalysis(start time.Time, deadline time.Duration) {
+	// 1. Re-analyze uncertain tracks
+	if configBool("reanalyze_uncertain", true) {
+		data, ok, _ := host.KVStoreGet("mood:reanalyze")
+		if ok && len(data) > 0 {
+			var ids map[string]bool
+			if err := json.Unmarshal(data, &ids); err == nil && len(ids) > 0 {
+				requeued := 0
+				for id := range ids {
+					if time.Since(start) >= deadline {
+						break
+					}
+					taskData, _ := json.Marshal(analysisTask{ID: id, Force: true})
+					if _, err := host.TaskEnqueue("mood-analysis", taskData); err == nil {
+						requeued++
+					}
+				}
+				// Clear queue — successfully re-queued tracks will update their own status
+				host.KVStoreSet("mood:reanalyze", []byte("{}"))
+				pdk.Log(pdk.LogInfo, fmt.Sprintf("Queued %d uncertain tracks for re-analysis", requeued))
+			}
+		}
+	}
+
+	// 2. Random re-analysis percentage
+	reanalyzePct := configInt("reanalyze_percent", 0)
+	if reanalyzePct <= 0 || time.Since(start) >= deadline {
+		return
+	}
+
+	indexData, ok, _ := host.KVStoreGet("mood:index")
+	if !ok || len(indexData) == 0 {
+		return
+	}
+	var index map[string]string // id → "title|artist"
+	if err := json.Unmarshal(indexData, &index); err != nil {
+		return
+	}
+
+	// Collect and shuffle all IDs
+	allIDs := make([]string, 0, len(index))
+	for id := range index {
+		allIDs = append(allIDs, id)
+	}
+	rand.Shuffle(len(allIDs), func(i, j int) { allIDs[i], allIDs[j] = allIDs[j], allIDs[i] })
+
+	sampleSize := len(allIDs) * reanalyzePct / 100
+	requeued := 0
+	for _, id := range allIDs[:sampleSize] {
+		if time.Since(start) >= deadline {
+			break
+		}
+		info := index[id]
+		parts := strings.SplitN(info, "|", 2)
+		title, artist := parts[0], ""
+		if len(parts) > 1 {
+			artist = parts[1]
+		}
+		taskData, _ := json.Marshal(analysisTask{ID: id, Title: title, Artist: artist, Force: true})
+		if _, err := host.TaskEnqueue("mood-analysis", taskData); err == nil {
+			requeued++
+		}
+	}
+	pdk.Log(pdk.LogInfo, fmt.Sprintf("Queued %d tracks for random re-analysis (%d%% of library)", requeued, reanalyzePct))
 }
 
 // ── Task Executor ─────────────────────────────────────────────────
@@ -455,10 +554,10 @@ func onTaskExecute() int32 {
 		return 1
 	}
 
-	// Skip if already analyzed (may have been queued twice)
+	// Skip if already analyzed, unless this is a forced re-analysis task
 	key := "mood:" + task.ID
 	existing, ok, _ := host.KVStoreGet(key)
-	if ok && len(existing) > 0 {
+	if ok && len(existing) > 0 && !task.Force {
 		return 0
 	}
 
@@ -481,6 +580,12 @@ func onTaskExecute() int32 {
 	}
 
 	updateIndex(task.ID, task.Title, task.Artist)
+
+	// Flag uncertain results for re-analysis on the next cycle
+	if isUncertain(scores) {
+		markUncertain(task.ID)
+	}
+
 	pdk.Log(pdk.LogInfo, "Analyzed: "+task.Title)
 	return 0
 }

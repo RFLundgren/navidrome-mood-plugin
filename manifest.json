@@ -52,6 +52,20 @@
           "description": "Cron expression for when to scan for and analyze new tracks",
           "default": "0 2 * * *"
         },
+        "reanalyze_uncertain": {
+          "type": "boolean",
+          "title": "Re-analyze Uncertain Tracks",
+          "description": "Automatically re-analyze tracks where no mood score was confident (improves accuracy over time)",
+          "default": true
+        },
+        "reanalyze_percent": {
+          "type": "integer",
+          "title": "Random Re-analysis %",
+          "description": "Percentage of already-analyzed tracks to randomly re-analyze each nightly run (0 = disabled). Useful for keeping scores fresh.",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 20
+        },
         "playlist_refresh_schedule": {
           "type": "string",
           "title": "Playlist Refresh Schedule (cron)",
@@ -187,6 +201,14 @@
                 {
                   "type": "Control",
                   "scope": "#/properties/analyze_schedule"
+                },
+                {
+                  "type": "Control",
+                  "scope": "#/properties/reanalyze_uncertain"
+                },
+                {
+                  "type": "Control",
+                  "scope": "#/properties/reanalyze_percent"
                 }
               ]
             }

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Mood Analyzer", version="1.1.0")
 
 MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
-ANALYSIS_DURATION = 90.0  # seconds — cap audio loaded per track for predictable analysis time
+ANALYSIS_DURATION = 120.0  # seconds — cap audio loaded per track for predictable analysis time
 
 _es = None
 
