@@ -68,7 +68,15 @@ mood-analyzer:
     - /path/to/your/music:/music:ro
   restart: unless-stopped
 ```
-
+or using the published image of the latest release with:
+```yaml
+mood-analyzer:
+  image: ghcr.io/RFLundgren/mood-analyzer:latest
+  container_name: mood-analyzer
+  volumes:
+    - /path/to/your/music:/music:ro
+  restart: unless-stopped
+```
 The music path must match what Navidrome sees — the analyzer reads the same audio files.
 
 ### 2. Install the Plugin
