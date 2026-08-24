@@ -85,6 +85,10 @@ services:
     restart: unless-stopped
     volumes:
       - /path/to/your/music:/music:ro
+    # environment:                          # all optional — defaults shown
+    #   MUSIC_DIR: /music                   # must match the container path above
+    #   MAX_ANALYSIS_FILE_SIZE_MB: "200"
+    #   FILE_ANALYSIS_TIMEOUT_SECONDS: "90"
     networks:
       - mood
 
@@ -94,6 +98,17 @@ networks:
 ```
 
 > **ARM64 users (Raspberry Pi):** The published image supports arm64. If you prefer to build locally, `cd analyzer-service && docker build --build-arg TARGETARCH=arm64 -t mood-analyzer .` will compile Essentia from source (~15–20 minutes on a Pi 5).
+
+#### Analyzer Service Environment Variables
+
+All optional — the container works out of the box with the defaults below. Only `MUSIC_DIR` needs attention, and only if you mount your library somewhere other than `/music` in the compose snippet above.
+
+| Variable | Default | Description |
+|----------|---------|--------------|
+| `MUSIC_DIR` | `/music` | Container path the analyzer will read local files from for `/api/analysis/file`. Must match the right-hand side of the `volumes:` mount above — requests for anything outside this directory (including via symlinks) are rejected. |
+| `MODELS_DIR` | `/app/models` | Where the Essentia/TensorFlow mood models live. The published image bakes them in at this path at build time; only relevant if you're customizing the Docker image. |
+| `MAX_ANALYSIS_FILE_SIZE_MB` | `200` | Local files above this size are rejected before decoding, so an unexpectedly huge file can't balloon memory during analysis. |
+| `FILE_ANALYSIS_TIMEOUT_SECONDS` | `90` | Wall-clock limit on a single `/api/analysis/file` request, mirroring the timeout `/api/analysis/url` already gets from its `ffmpeg` call. |
 
 ### 2. Install the Plugin
 
