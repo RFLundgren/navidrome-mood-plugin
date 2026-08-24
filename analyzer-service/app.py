@@ -10,6 +10,7 @@ are used to improve classification accuracy.
 Run with: uvicorn app:app --host 0.0.0.0 --port 8000
 """
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -36,6 +37,26 @@ app = FastAPI(title="Mood Analyzer", version="1.3.0")
 
 MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
 ANALYSIS_DURATION = 120.0  # seconds — cap audio loaded per track for predictable analysis time
+
+# /api/analysis/file must never read outside of this directory (see
+# _resolve_music_path below). Resolved once at import time so every later
+# comparison uses the same, symlink-free baseline.
+MUSIC_DIR = os.path.realpath(os.environ.get("MUSIC_DIR", "/music"))
+
+# Reject local files above this size before decoding — a legitimate track
+# is a few tens of MB at most; this just keeps a mistaken/huge file from
+# ballooning memory during decode.
+MAX_ANALYSIS_FILE_SIZE_MB = int(os.environ.get("MAX_ANALYSIS_FILE_SIZE_MB", "200"))
+MAX_ANALYSIS_FILE_SIZE_BYTES = MAX_ANALYSIS_FILE_SIZE_MB * 1024 * 1024
+
+# Wall-clock safety net for /api/analysis/file, mirroring the timeout
+# /api/analysis/url already gets from its ffmpeg subprocess call. Note this
+# bounds how long the *request* waits, not the underlying native decode —
+# essentia calls run in a worker thread and Python cannot forcibly kill a
+# thread, so a pathological input can still burn CPU in the background
+# after the client gets its 504. MUSIC_DIR containment + the size cap above
+# are what actually keep untrusted input out of that code path.
+FILE_ANALYSIS_TIMEOUT_SECONDS = float(os.environ.get("FILE_ANALYSIS_TIMEOUT_SECONDS", "90"))
 
 _es = None
 _models = {}
@@ -385,11 +406,55 @@ def _analyze_path(file_path: str, api_key: str = "", genre_weight: float = 1.0, 
             "album": album, "genre": genre, **results}
 
 
+def _resolve_music_path(file_path: str) -> str:
+    """Resolve file_path and enforce that it stays inside MUSIC_DIR.
+
+    file_path may be absolute or relative to MUSIC_DIR either way; symlinks
+    are fully resolved via realpath() *before* the containment check, so a
+    symlink that lives inside MUSIC_DIR but points outside of it is caught
+    too. Raises HTTPException for anything that isn't a regular file inside
+    MUSIC_DIR, or that exceeds MAX_ANALYSIS_FILE_SIZE_BYTES.
+    """
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path is required")
+
+    candidate = file_path if os.path.isabs(file_path) else os.path.join(MUSIC_DIR, file_path)
+    resolved = os.path.realpath(candidate)
+
+    if os.path.commonpath([resolved, MUSIC_DIR]) != MUSIC_DIR:
+        logger.warning(f"Rejected file_path outside MUSIC_DIR: {file_path!r} -> {resolved!r}")
+        raise HTTPException(status_code=403, detail="file_path must be inside the music library")
+
+    # isfile() follows symlinks (already resolved above) and is False for
+    # directories, device files, pipes, sockets, etc. — this alone blocks
+    # things like /dev/zero or /dev/null even if they somehow resolved
+    # inside MUSIC_DIR.
+    if not os.path.isfile(resolved):
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+
+    if os.path.getsize(resolved) > MAX_ANALYSIS_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds the {MAX_ANALYSIS_FILE_SIZE_MB} MB analysis limit",
+        )
+
+    return resolved
+
+
 @app.post("/api/analysis/file")
 def analyze_file(req: AnalyzeRequest):
-    if not os.path.exists(req.file_path):
-        raise HTTPException(status_code=404, detail=f"File not found: {req.file_path}")
-    return _analyze_path(req.file_path, req.lastfm_api_key, req.genre_weight, req.lastfm_weight)
+    resolved_path = _resolve_music_path(req.file_path)
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(_analyze_path, resolved_path, req.lastfm_api_key, req.genre_weight, req.lastfm_weight)
+    try:
+        return future.result(timeout=FILE_ANALYSIS_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        logger.error(f"Analysis timed out after {FILE_ANALYSIS_TIMEOUT_SECONDS}s for {resolved_path}")
+        raise HTTPException(status_code=504, detail="Analysis timed out")
+    finally:
+        # wait=False: don't block this response on a hung worker thread.
+        pool.shutdown(wait=False)
 
 
 @app.post("/api/analysis/url")
